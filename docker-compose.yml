@@ -1,0 +1,25 @@
+services:
+  limiter:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      ENVIRONMENT: development
+      REDIS_URL: redis://redis:6379/0
+      DEFAULT_POLICY: 60/minute;algorithm=sliding_counter
+      SERVICE_POLICY: 1000/minute;algorithm=token_bucket
+      # API_KEY: set-me-to-require-X-API-Key
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2   # limits are shared through Redis; scale freely
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
