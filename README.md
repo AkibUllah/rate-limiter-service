@@ -1,3 +1,4 @@
+<!-- topics: rate-limiting,token-bucket,sliding-window,gcra,redis,lua,fastapi,python,middleware -->
 # Rate Limiter Service
 
 Distributed rate limiting as a library, an ASGI middleware and a standalone service: five algorithms (token bucket, fixed window, sliding log, sliding window counter, GCRA) over in-memory or Redis backends, with time injected so every behaviour is testable without sleeping.
