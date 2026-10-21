@@ -8,6 +8,15 @@ Distributed rate limiting as a library, an ASGI middleware and a standalone serv
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+## Try it live
+
+| | |
+|---|---|
+| API reference | https://akibullah.github.io/rate-limiter-service/ — Swagger UI built from the exported OpenAPI document (static; no backend behind it) |
+| Run in your browser | [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/AkibUllah/rate-limiter-service?quickstart=1) — starts two Redis-backed replicas with `docker compose` and seeds an `otp` policy (5 per 5 minutes); open forwarded port 8000 at `/docs` and call `POST /v1/check` a few times. |
+| One-click deploy | [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AkibUllah/rate-limiter-service) — `render.yaml` provisions the web service and a free Key Value store; `API_KEY` is generated, send it as `X-API-Key` on `/v1/*`. |
+| Local | `docker compose up` (see Quick Start) |
+
 ## Why this exists
 
 Payment APIs get hammered by retry storms, OTP endpoints get brute-forced, and a cloud control plane has to keep one noisy tenant from starving the rest. Each time, the first version is a dict in one process; the second version moves it to Redis and discovers that `GET`, compute, `SET` is not atomic under load. This repo is the version I want to start from: algorithms separated from storage, Redis operations done in Lua so they are atomic across instances, a middleware that sets the standard `X-RateLimit-*` headers, and a service for callers that are not Python.

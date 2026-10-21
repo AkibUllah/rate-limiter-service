@@ -2,7 +2,7 @@ PY ?= python3
 VENV ?= .venv
 BIN := $(VENV)/bin
 
-.PHONY: venv install dev test lint fmt run docker-up docker-down clean
+.PHONY: venv install dev test lint fmt run openapi docker-up docker-down clean bench
 
 venv:
 	$(PY) -m venv $(VENV)
@@ -25,6 +25,9 @@ lint:
 fmt:
 	$(BIN)/ruff format src tests
 	$(BIN)/ruff check --fix src tests
+
+openapi:
+	$(BIN)/python scripts/export_openapi.py
 
 docker-up:
 	docker compose up --build -d

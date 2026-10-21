@@ -1,0 +1,36 @@
+# Render blueprint: the limiter service plus a Key Value (Redis-compatible) store for shared limits.
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: rate-limiter-service
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: KEY_PREFIX
+        value: "rl:"
+      - key: DEFAULT_POLICY
+        value: 60/minute;algorithm=sliding_counter
+      - key: SERVICE_POLICY
+        value: 1000/minute;algorithm=token_bucket
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: rate-limiter-redis
+          property: connectionString
+      - key: API_KEY
+        generateValue: true
+
+  - type: keyvalue
+    name: rate-limiter-redis
+    plan: free
+    ipAllowList: []
