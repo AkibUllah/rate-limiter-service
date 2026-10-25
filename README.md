@@ -4,6 +4,8 @@
 Distributed rate limiting as a library, an ASGI middleware and a standalone service: five algorithms (token bucket, fixed window, sliding log, sliding window counter, GCRA) over in-memory or Redis backends, with time injected so every behaviour is testable without sleeping.
 
 [![CI](https://github.com/AkibUllah/rate-limiter-service/actions/workflows/ci.yml/badge.svg)](https://github.com/AkibUllah/rate-limiter-service/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/AkibUllah/rate-limiter-service/actions/workflows/codeql.yml/badge.svg)](https://github.com/AkibUllah/rate-limiter-service/actions/workflows/codeql.yml)
+[![Release](https://img.shields.io/github/v/release/AkibUllah/rate-limiter-service)](https://github.com/AkibUllah/rate-limiter-service/releases)
 ![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -16,6 +18,16 @@ Distributed rate limiting as a library, an ASGI middleware and a standalone serv
 | Run in your browser | [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/AkibUllah/rate-limiter-service?quickstart=1) — starts two Redis-backed replicas with `docker compose` and seeds an `otp` policy (5 per 5 minutes); open forwarded port 8000 at `/docs` and call `POST /v1/check` a few times. |
 | One-click deploy | [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AkibUllah/rate-limiter-service) — `render.yaml` provisions the web service and a free Key Value store; `API_KEY` is generated, send it as `X-API-Key` on `/v1/*`. |
 | Local | `docker compose up` (see Quick Start) |
+
+## Screenshots
+
+![Swagger UI API reference](docs/images/api-reference.png)
+
+Live API reference on GitHub Pages: check, reset and policy CRUD endpoints.
+
+![curl session and benchmark output](docs/images/terminal-demo.png)
+
+A real run: an OTP policy (3 per 5 minutes, GCRA) denying the fourth request with `retry_after`, a second key with its own budget, and the in-memory benchmark for all five algorithms.
 
 ## Why this exists
 
@@ -231,11 +243,11 @@ Covered: policy parsing and validation; for every algorithm on both backends: li
 
 ## Roadmap
 
-- Async backend variant (`redis.asyncio`) for fully non-blocking middleware
-- Multi-policy checks (e.g. `10/second` and `1000/hour` evaluated together)
-- Prometheus metrics (allowed/denied per policy) and a `/v1/inspect` endpoint for current key state
-- Local cache with Redis as the source of truth for very hot keys
-- Client SDK snippets (Go, Node) for the service API
+- [ ] Async backend variant (`redis.asyncio`) for fully non-blocking middleware (#1)
+- [ ] Multi-policy checks (e.g. `10/second` and `1000/hour` evaluated together) (#2)
+- [ ] Prometheus metrics (allowed/denied per policy) and a `/v1/inspect` endpoint for current key state (#3)
+- [ ] Local cache with Redis as the source of truth for very hot keys (#4)
+- [ ] Client SDK snippets (Go, Node) for the service API (#5)
 
 ## License
 
