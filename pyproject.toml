@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rate-limiter-service"
-version = "0.1.0"
+version = "0.2.0"
 description = "Distributed rate limiting: token bucket, fixed/sliding windows and GCRA over in-memory or Redis backends, plus a FastAPI service and Starlette middleware."
 readme = "README.md"
 license = { text = "MIT" }
@@ -26,7 +26,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+metrics = ["prometheus-client>=0.20"]
 dev = [
+  "prometheus-client>=0.20",
   "pytest>=8.0",
   "httpx>=0.26",
   "fakeredis[lua]>=2.21",

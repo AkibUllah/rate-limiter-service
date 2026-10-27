@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import secrets
+from functools import partial
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security, status
 from fastapi.security import APIKeyHeader
 
 from .. import __version__
@@ -14,12 +15,14 @@ from ..clock import Clock
 from ..limiter import RateLimiter
 from ..middleware import RateLimitMiddleware
 from ..policy import Algorithm, Policy
+from . import metrics as prom
 from .config import Settings, get_settings
 from .schemas import (
     AlgorithmOut,
     CheckIn,
     CheckOut,
     HealthOut,
+    InspectOut,
     MessageOut,
     PolicyIn,
     PolicyOut,
@@ -89,13 +92,19 @@ def create_app(
     app.state.settings = settings
     app.state.limiter = limiter
     app.state.policy_store = policy_store
+    app.state.metrics = None
+    if settings.metrics_enabled:
+        if prom.available():
+            app.state.metrics = prom.Metrics(backend="redis" if limiter.blocking else "memory")
+        else:
+            log.warning("METRICS_ENABLED is set but prometheus-client is not installed")
 
     if settings.service_policy:
         app.add_middleware(
             RateLimitMiddleware,
             limiter=limiter,
             policy=Policy.parse(settings.service_policy, name="__service__"),
-            exempt_paths=("/health", "/docs", "/openapi.json"),
+            exempt_paths=("/health", "/metrics", "/docs", "/openapi.json"),
         )
 
     protected = [Depends(require_api_key)]
@@ -108,6 +117,12 @@ def create_app(
             backend="redis" if limiter.blocking else "memory",
             policies=len(_store(request).list()),
         )
+
+    if app.state.metrics is not None:
+
+        @app.get("/metrics", tags=["meta"], response_class=Response)
+        def metrics() -> Response:
+            return Response(app.state.metrics.render(), media_type=app.state.metrics.content_type)
 
     @app.get("/v1/algorithms", response_model=list[AlgorithmOut], tags=["meta"])
     def algorithms() -> list[AlgorithmOut]:
@@ -125,7 +140,9 @@ def create_app(
             if policy is None:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, f"Policy {name!r} not found")
             policy_name = name
-        decision = _limiter(request).check(payload.key, policy, cost=payload.cost)
+        run = partial(_limiter(request).check, payload.key, policy, cost=payload.cost)
+        metrics = app.state.metrics
+        decision = metrics.observe(policy_name, run) if metrics is not None else run()
         return CheckOut(
             allowed=decision.allowed,
             limit=decision.limit,
@@ -135,6 +152,30 @@ def create_app(
             key=payload.key,
             policy=policy_name,
             algorithm=decision.algorithm,
+        )
+
+    @app.get("/v1/inspect", response_model=InspectOut, tags=["limits"], dependencies=protected)
+    def inspect(
+        request: Request,
+        key: str = Query(min_length=1, max_length=256),
+        policy: str = Query(default="default", description="Name of a stored policy"),
+        cost: int = Query(default=1, gt=0, le=10_000),
+    ) -> InspectOut:
+        """Current state of `key` under a stored policy. Read-only: consumes nothing."""
+        stored = _store(request).get(policy)
+        if stored is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Policy {policy!r} not found")
+        decision = _limiter(request).peek(key, stored, cost=cost)
+        return InspectOut(
+            would_allow=decision.allowed,
+            limit=decision.limit,
+            remaining=decision.remaining,
+            retry_after=round(decision.retry_after, 6),
+            reset_after=round(decision.reset_after, 6),
+            key=key,
+            policy=policy,
+            algorithm=decision.algorithm,
+            cost=cost,
         )
 
     @app.post("/v1/reset", response_model=MessageOut, tags=["limits"], dependencies=protected)

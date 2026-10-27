@@ -18,7 +18,7 @@ from .limiter import RateLimiter
 from .middleware import RateLimitMiddleware, client_ip_key, header_key
 from .policy import Algorithm, Policy
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Algorithm",

@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-27
+
 ### Added
 
+- `RateLimiter.peek(key, policy, cost=1)`: reports whether a request would pass, the remaining budget, `retry_after` and `reset_after` without consuming anything. Every backend method takes a `dry_run` flag; the Redis Lua scripts skip all writes, pruning and TTL updates in a dry run (#3).
+- `GET /v1/inspect?key=&policy=&cost=` on the service, backed by `peek` and protected by the API key like the rest of `/v1/*` (#3).
+- Prometheus metrics at `/metrics` (optional `metrics` extra, included in the Docker image): `ratelimiter_decisions_total{policy,algorithm,outcome}` and the `ratelimiter_backend_latency_seconds{backend,algorithm}` histogram. Toggle with `METRICS_ENABLED` (#3).
 - CodeQL code scanning workflow and Dependabot configuration (pip, Docker, GitHub Actions).
 - API reference and terminal screenshots in the README.
 - Roadmap tracked as GitHub issues under the `v0.2.0` milestone.
@@ -33,5 +38,6 @@ First public release.
 - Injectable `ManualClock` for deterministic tests and benchmarks; only accepted requests consume quota.
 - Benchmark script, Docker image, docker compose with two Redis-backed replicas, CI on Python 3.10/3.11, Pages API reference, Codespaces and Render kits.
 
-[Unreleased]: https://github.com/AkibUllah/rate-limiter-service/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/AkibUllah/rate-limiter-service/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/AkibUllah/rate-limiter-service/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AkibUllah/rate-limiter-service/releases/tag/v0.1.0

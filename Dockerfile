@@ -11,7 +11,7 @@ RUN addgroup --system app && adduser --system --ingroup app app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --upgrade pip && pip install .
+RUN pip install --upgrade pip && pip install ".[metrics]"
 
 USER app
 EXPOSE 8000

@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     default_policy: str = "60/minute;algorithm=sliding_counter"
     service_policy: str | None = "1000/minute;algorithm=token_bucket"
 
+    # Serve Prometheus metrics at /metrics (needs the `metrics` extra / prometheus-client).
+    metrics_enabled: bool = True
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

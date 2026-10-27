@@ -42,6 +42,8 @@ Payment APIs get hammered by retry storms, OTP endpoints get brute-forced, and a
 - `Decision` objects carrying `allowed`, `remaining`, `retry_after`, `reset_after` and ready-made HTTP headers
 - Pure ASGI `RateLimitMiddleware` for FastAPI/Starlette: `X-RateLimit-Limit/Remaining/Reset`, `429` with `Retry-After`, IP or header keys, per-request policy selection, exempt paths, hooks
 - FastAPI service: `POST /v1/check` with named or inline policies, policy CRUD (stored in memory or in a Redis hash shared by all instances), `POST /v1/reset`, `/health`, optional API key, and the middleware guarding the service itself
+- Read-only inspection: `RateLimiter.peek()` and `GET /v1/inspect` report remaining budget, `retry_after` and `reset_after` for a key without consuming anything (dry-run Lua scripts on Redis that never write, never prune and never touch TTLs)
+- Prometheus metrics at `/metrics`: `ratelimiter_decisions_total{policy,algorithm,outcome}` and a `ratelimiter_backend_latency_seconds{backend,algorithm}` histogram, one registry per app
 - Injectable clock (`ManualClock`) so tests and benchmarks move time deterministically
 - Only accepted requests consume quota, so a client that keeps retrying while limited is not pushed further into the future
 - Benchmark script with real numbers below
@@ -72,6 +74,7 @@ Key decisions:
 - **Time is a parameter.** The limiter reads one clock and passes the timestamp into the backend; Redis never calls `TIME`. That makes behaviour deterministic under test and keeps instances with the same wall clock in agreement.
 - **Atomicity via Lua.** Every Redis step is a single `EVALSHA`, so two instances racing on the same key cannot both see "one slot left". Floats come back as strings because Redis truncates Lua numbers.
 - **Accepted requests consume, denied ones do not.** A denied request leaves the state untouched; `retry_after` tells the caller exactly when the next unit frees up.
+- **Inspection runs the same code path.** `peek` is the same backend step with a `dry_run` flag, so what `/v1/inspect` reports is exactly what the next `/v1/check` would decide. On Redis the sliding-log dry run skips expired entries by rank (`ZCOUNT` + `ZRANGE`) instead of deleting them, so a peek is a pure read.
 - **Pure ASGI middleware.** No `BaseHTTPMiddleware`, so streaming responses work and the per-request overhead is a dictionary lookup for the memory backend; Redis calls are offloaded to a thread so they do not block the event loop.
 
 ## Algorithms
@@ -109,6 +112,7 @@ make bench   # or: python bench/bench.py --iterations 200000 --keys 1000
 | Library | Python 3.10+, dataclasses, `typing.Protocol` |
 | Storage | in-process dicts; Redis 7 via `redis-py` with Lua scripts |
 | Service | FastAPI, Pydantic v2, pydantic-settings, uvicorn |
+| Observability | prometheus-client (optional `metrics` extra; installed in the Docker image) |
 | Tooling | pytest, httpx TestClient, fakeredis[lua], ruff, GitHub Actions |
 | Runtime | Docker (python:3.11-slim, non-root), docker compose with Redis and two replicas |
 
@@ -127,7 +131,7 @@ docker compose up --build
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev]"      # add ",metrics" outside dev to serve /metrics
 uvicorn ratelimiter.service.asgi:app --reload
 ```
 
@@ -187,6 +191,33 @@ app.add_middleware(
 
 `policy` may also be a callable `scope -> Policy | None` to pick limits per route or per tenant (returning `None` skips limiting).
 
+### Inspecting a key
+
+```python
+state = limiter.peek("user:42", policy)          # consumes nothing, safe to call repeatedly
+state.remaining, state.retry_after, state.reset_after
+limiter.peek("user:42", policy, cost=5).allowed  # would a 5-unit request pass right now?
+```
+
+Over HTTP:
+
+```bash
+curl -s 'localhost:8000/v1/inspect?policy=otp&key=phone:%2B8801711000000'
+# {"would_allow":true,"limit":5,"remaining":3,"retry_after":0.0,"reset_after":241.3,...,"cost":1}
+```
+
+### Metrics
+
+With `prometheus-client` installed (`pip install "rate-limiter-service[metrics]"`, already in the Docker image) and `METRICS_ENABLED=true` (the default), `/metrics` serves:
+
+```text
+ratelimiter_decisions_total{algorithm="sliding_log",outcome="allowed",policy="otp"} 5.0
+ratelimiter_decisions_total{algorithm="sliding_log",outcome="denied",policy="otp"} 2.0
+ratelimiter_backend_latency_seconds_bucket{algorithm="sliding_log",backend="redis",le="0.001"} 6.0
+```
+
+Useful queries: deny ratio per policy `sum by (policy) (rate(ratelimiter_decisions_total{outcome="denied"}[5m])) / sum by (policy) (rate(ratelimiter_decisions_total[5m]))`, and backend p99 `histogram_quantile(0.99, sum by (le, backend) (rate(ratelimiter_backend_latency_seconds_bucket[5m])))`. Inline policies are counted under `policy="inline"` to keep label cardinality bounded. `/metrics` has no API key and is exempt from `SERVICE_POLICY`; keep it on an internal network or set `METRICS_ENABLED=false`.
+
 ### Deterministic tests
 
 ```python
@@ -208,7 +239,9 @@ assert limiter.check("k", policy).allowed
 | GET | `/health` | Status, backend in use, number of stored policies |
 | GET | `/v1/algorithms` | Algorithms with one-line descriptions |
 | POST | `/v1/check` | `{key, policy?, inline?, cost?}` -> `{allowed, limit, remaining, retry_after, reset_after, ...}` |
+| GET | `/v1/inspect?key=&policy=&cost=` | Current state of a key under a stored policy, without consuming: `{would_allow, remaining, retry_after, reset_after, ...}` |
 | POST | `/v1/reset` | Clear the state of one key under a named policy |
+| GET | `/metrics` | Prometheus metrics (when enabled and `prometheus-client` is installed) |
 | GET / POST | `/v1/policies` | List / create named policies |
 | GET / PUT / DELETE | `/v1/policies/{name}` | Read / upsert / delete a policy (`default` cannot be deleted) |
 
@@ -221,15 +254,15 @@ src/ratelimiter/
 ├── policy.py          # Policy, Algorithm, string parsing
 ├── decision.py        # Decision + HTTP headers
 ├── clock.py           # Clock protocol, SystemClock, ManualClock
-├── limiter.py         # RateLimiter: dispatch + key scoping
+├── limiter.py         # RateLimiter: dispatch, key scoping, check / peek
 ├── middleware.py      # RateLimitMiddleware, client_ip_key, header_key
 ├── backends/
 │   ├── base.py        # Backend protocol
 │   ├── memory.py      # MemoryBackend
 │   └── redis.py       # RedisBackend (Lua scripts)
-└── service/           # FastAPI app: config, policy store, schemas, app factory, asgi
+└── service/           # FastAPI app: config, policy store, schemas, metrics, app factory, asgi
 bench/bench.py         # benchmark producing the table above
-tests/                 # 114 tests; algorithm suite runs on memory and fakeredis backends
+tests/                 # 180 tests; algorithm suite runs on memory and fakeredis backends
 ```
 
 ## Testing
@@ -239,13 +272,12 @@ make test   # or: pytest
 make lint
 ```
 
-Covered: policy parsing and validation; for every algorithm on both backends: limit-then-deny, independent keys, denied requests not consuming quota, recovery after the window, reset, weighted cost, decision metadata; algorithm-specific behaviour (fixed-window boundary burst, exact sliding log expiry, weighted sliding counter and its `retry_after` prediction, token bucket refill and capacity cap, GCRA spacing and burst); middleware headers, 429 body, exempt paths, header/IP keys with `X-Forwarded-For`, per-request policy selection, cost and hooks; service health, policy CRUD, named/inline/default checks, reset, validation, API key, self-protection, two Redis-backed instances sharing policies and state; benchmark smoke run.
+Covered: policy parsing and validation; for every algorithm on both backends: limit-then-deny, independent keys, denied requests not consuming quota, recovery after the window, reset, weighted cost, decision metadata; algorithm-specific behaviour (fixed-window boundary burst, exact sliding log expiry, weighted sliding counter and its `retry_after` prediction, token bucket refill and capacity cap, GCRA spacing and burst); middleware headers, 429 body, exempt paths, header/IP keys with `X-Forwarded-For`, per-request policy selection, cost and hooks; service health, policy CRUD, named/inline/default checks, reset, validation, API key, self-protection, two Redis-backed instances sharing policies and state; `peek` on both backends for every algorithm (no keys created, no state change across interleaved peeks, matches the next check, cost-aware, expired sliding-log entries left in place); metrics labels, latency histogram, per-app registries, disabling, `/v1/inspect` semantics and validation; benchmark smoke run.
 
 ## Roadmap
 
 - [ ] Async backend variant (`redis.asyncio`) for fully non-blocking middleware (#1)
 - [ ] Multi-policy checks (e.g. `10/second` and `1000/hour` evaluated together) (#2)
-- [ ] Prometheus metrics (allowed/denied per policy) and a `/v1/inspect` endpoint for current key state (#3)
 - [ ] Local cache with Redis as the source of truth for very hot keys (#4)
 - [ ] Client SDK snippets (Go, Node) for the service API (#5)
 

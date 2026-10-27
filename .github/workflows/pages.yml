@@ -28,7 +28,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
+          pip install -e ".[metrics]"
       - name: Build _site
         run: |
           mkdir -p _site
