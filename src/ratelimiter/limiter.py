@@ -35,6 +35,23 @@ class RateLimiter:
 
     def check(self, key: str, policy: Policy, cost: int = 1) -> Decision:
         """Try to consume `cost` units for `key` under `policy`."""
+        decision = self._evaluate(key, policy, cost, dry_run=False)
+        if not decision.allowed:
+            log.debug(
+                "rate limited key=%s policy=%s retry_after=%.3f", key, policy, decision.retry_after
+            )
+        return decision
+
+    def peek(self, key: str, policy: Policy, cost: int = 1) -> Decision:
+        """Report the state of `key` without consuming anything.
+
+        ``allowed`` tells whether a request of `cost` units would be accepted right now,
+        ``remaining`` is the budget left before that request and ``retry_after`` is how long
+        until it would be accepted. Calling this any number of times leaves the state unchanged.
+        """
+        return self._evaluate(key, policy, cost, dry_run=True)
+
+    def _evaluate(self, key: str, policy: Policy, cost: int, dry_run: bool) -> Decision:
         if cost <= 0:
             raise ValueError("cost must be positive")
         now = self.clock.now()
@@ -42,20 +59,22 @@ class RateLimiter:
         algorithm = policy.algorithm
 
         if algorithm is Algorithm.FIXED_WINDOW:
-            raw = self.backend.fixed_window(skey, policy.limit, policy.window, cost, now)
+            raw = self.backend.fixed_window(skey, policy.limit, policy.window, cost, now, dry_run)
         elif algorithm is Algorithm.SLIDING_LOG:
-            raw = self.backend.sliding_log(skey, policy.limit, policy.window, cost, now)
+            raw = self.backend.sliding_log(skey, policy.limit, policy.window, cost, now, dry_run)
         elif algorithm is Algorithm.SLIDING_COUNTER:
-            raw = self.backend.sliding_counter(skey, policy.limit, policy.window, cost, now)
+            raw = self.backend.sliding_counter(
+                skey, policy.limit, policy.window, cost, now, dry_run
+            )
         elif algorithm is Algorithm.TOKEN_BUCKET:
-            raw = self.backend.token_bucket(skey, policy.capacity, policy.rate, cost, now)
+            raw = self.backend.token_bucket(skey, policy.capacity, policy.rate, cost, now, dry_run)
         elif algorithm is Algorithm.GCRA:
-            raw = self.backend.gcra(skey, policy.period, policy.capacity, cost, now)
+            raw = self.backend.gcra(skey, policy.period, policy.capacity, cost, now, dry_run)
         else:  # pragma: no cover - enum is exhaustive
             raise ValueError(f"unsupported algorithm {algorithm!r}")
 
         allowed, remaining, retry_after, reset_after = raw
-        decision = Decision(
+        return Decision(
             allowed=allowed,
             limit=policy.capacity
             if algorithm in (Algorithm.TOKEN_BUCKET, Algorithm.GCRA)
@@ -66,9 +85,6 @@ class RateLimiter:
             key=key,
             algorithm=algorithm,
         )
-        if not allowed:
-            log.debug("rate limited key=%s policy=%s retry_after=%.3f", key, policy, retry_after)
-        return decision
 
     def reset(self, key: str, policy: Policy) -> None:
         self.backend.reset(self.storage_key(key, policy))

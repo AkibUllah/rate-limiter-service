@@ -75,6 +75,18 @@ class CheckOut(BaseModel):
     algorithm: Algorithm
 
 
+class InspectOut(BaseModel):
+    would_allow: bool = Field(description="Whether a request of `cost` units would pass now")
+    limit: int
+    remaining: int = Field(description="Units left before that request")
+    retry_after: float = Field(description="Seconds until a request of `cost` units would pass")
+    reset_after: float = Field(description="Seconds until the key's budget is full again")
+    key: str
+    policy: str
+    algorithm: Algorithm
+    cost: int
+
+
 class ResetIn(BaseModel):
     key: str = Field(min_length=1, max_length=256)
     policy: str = Field(description="Name of the stored policy whose state should be cleared")
