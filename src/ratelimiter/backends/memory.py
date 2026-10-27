@@ -48,32 +48,36 @@ class MemoryBackend:
     # ------------------------------------------------------------------ algorithms
 
     def fixed_window(
-        self, key: str, limit: int, window: float, cost: int, now: float
+        self, key: str, limit: int, window: float, cost: int, now: float, dry_run: bool = False
     ) -> RawDecision:
         start = math.floor(now / window) * window
         with self._lock:
             state = self._fixed.get(key)
             if state is None or state.start != start:
                 state = _Window(start=start, count=0)
-                self._fixed[key] = state
+                if not dry_run:
+                    self._fixed[key] = state
             allowed = state.count + cost <= limit
-            if allowed:
+            if allowed and not dry_run:
                 state.count += cost
             remaining = limit - state.count
         reset_after = start + window - now
         return allowed, remaining, (0.0 if allowed else reset_after), reset_after
 
     def sliding_log(
-        self, key: str, limit: int, window: float, cost: int, now: float
+        self, key: str, limit: int, window: float, cost: int, now: float, dry_run: bool = False
     ) -> RawDecision:
+        boundary = now - window
         with self._lock:
-            log = self._logs.setdefault(key, _Log())
-            entries = log.entries
-            boundary = now - window
-            while entries and entries[0] <= boundary:
-                entries.popleft()
+            if dry_run:
+                log = self._logs.get(key)
+                entries = deque(t for t in (log.entries if log else ()) if t > boundary)
+            else:
+                entries = self._logs.setdefault(key, _Log()).entries
+                while entries and entries[0] <= boundary:
+                    entries.popleft()
             allowed = len(entries) + cost <= limit
-            if allowed:
+            if allowed and not dry_run:
                 entries.extend([now] * cost)
             remaining = limit - len(entries)
             oldest = entries[0] if entries else None
@@ -81,24 +85,26 @@ class MemoryBackend:
         return allowed, remaining, (0.0 if allowed else reset_after), reset_after
 
     def sliding_counter(
-        self, key: str, limit: int, window: float, cost: int, now: float
+        self, key: str, limit: int, window: float, cost: int, now: float, dry_run: bool = False
     ) -> RawDecision:
         start = math.floor(now / window) * window
         with self._lock:
-            state = self._sliding.setdefault(key, _SlidingCounter())
+            state = self._sliding.get(key) or _SlidingCounter()
+            current, previous = state.current, state.previous
             if state.start is None:
-                state.start, state.current, state.previous = start, 0, 0
+                current, previous = 0, 0
             elif state.start != start:
-                state.previous = state.current if state.start == start - window else 0
-                state.current = 0
-                state.start = start
+                previous = current if state.start == start - window else 0
+                current = 0
             elapsed = (now - start) / window
-            estimate = state.previous * (1 - elapsed) + state.current
+            estimate = previous * (1 - elapsed) + current
             allowed = estimate + cost <= limit + EPSILON
-            if allowed:
-                state.current += cost
+            if allowed and not dry_run:
+                current += cost
                 estimate += cost
-            previous, current = state.previous, state.current
+            if not dry_run:
+                state.start, state.current, state.previous = start, current, previous
+                self._sliding[key] = state
         reset_after = start + window - now
         retry_after = 0.0
         if not allowed:
@@ -110,25 +116,27 @@ class MemoryBackend:
         return allowed, max(limit - estimate, 0.0), retry_after, reset_after
 
     def token_bucket(
-        self, key: str, capacity: int, rate: float, cost: int, now: float
+        self, key: str, capacity: int, rate: float, cost: int, now: float, dry_run: bool = False
     ) -> RawDecision:
         with self._lock:
             bucket = self._buckets.get(key)
-            if bucket is None:
-                bucket = _Bucket(tokens=float(capacity), last=now)
-                self._buckets[key] = bucket
-            elapsed = max(now - bucket.last, 0.0)
-            bucket.tokens = min(float(capacity), bucket.tokens + elapsed * rate)
-            bucket.last = now
-            allowed = bucket.tokens + EPSILON >= cost
-            if allowed:
-                bucket.tokens -= cost
-            tokens = bucket.tokens
+            tokens, last = (
+                (float(capacity), now) if bucket is None else (bucket.tokens, bucket.last)
+            )
+            elapsed = max(now - last, 0.0)
+            tokens = min(float(capacity), tokens + elapsed * rate)
+            allowed = tokens + EPSILON >= cost
+            if allowed and not dry_run:
+                tokens -= cost
+            if not dry_run:
+                self._buckets[key] = _Bucket(tokens=tokens, last=now)
         retry_after = 0.0 if allowed else (cost - tokens) / rate
         reset_after = (capacity - tokens) / rate
         return allowed, math.floor(tokens + EPSILON), retry_after, reset_after
 
-    def gcra(self, key: str, period: float, burst: int, cost: int, now: float) -> RawDecision:
+    def gcra(
+        self, key: str, period: float, burst: int, cost: int, now: float, dry_run: bool = False
+    ) -> RawDecision:
         with self._lock:
             tat = self._tat.get(key, now)
             if tat < now:
@@ -136,7 +144,7 @@ class MemoryBackend:
             new_tat = tat + period * cost
             allow_at = new_tat - burst * period
             allowed = allow_at <= now + EPSILON
-            if allowed:
+            if allowed and not dry_run:
                 self._tat[key] = new_tat
                 tat = new_tat
         remaining = max(math.floor((now + burst * period - tat) / period + EPSILON), 0)

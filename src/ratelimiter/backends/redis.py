@@ -11,14 +11,17 @@ from .base import RawDecision
 FIXED_WINDOW = """
 local now = tonumber(ARGV[1]); local limit = tonumber(ARGV[2])
 local window = tonumber(ARGV[3]); local cost = tonumber(ARGV[4])
+local dry = ARGV[5] == '1'
 local start = math.floor(now / window) * window
 local wkey = KEYS[1] .. ':' .. string.format('%.0f', start)
 local count = tonumber(redis.call('GET', wkey) or '0')
 local allowed = 0
 if count + cost <= limit then
-  count = count + cost
-  redis.call('SET', wkey, count, 'PX', math.ceil(window * 1000) + 1000)
   allowed = 1
+  if not dry then
+    count = count + cost
+    redis.call('SET', wkey, count, 'PX', math.ceil(window * 1000) + 1000)
+  end
 end
 local reset_after = start + window - now
 local retry_after = 0
@@ -29,17 +32,27 @@ return {allowed, tostring(limit - count), tostring(retry_after), tostring(reset_
 SLIDING_LOG = """
 local now = tonumber(ARGV[1]); local limit = tonumber(ARGV[2])
 local window = tonumber(ARGV[3]); local cost = tonumber(ARGV[4]); local nonce = ARGV[5]
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)
-local count = redis.call('ZCARD', KEYS[1])
+local dry = ARGV[6] == '1'
+-- Entries with score <= now - window have expired. A dry run skips them by rank instead of
+-- deleting them, so the sorted set is left exactly as it was.
+local expired = 0
+if dry then
+  expired = redis.call('ZCOUNT', KEYS[1], '-inf', now - window)
+else
+  redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)
+end
+local count = redis.call('ZCARD', KEYS[1]) - expired
 local allowed = 0
 if count + cost <= limit then
-  for i = 1, cost do redis.call('ZADD', KEYS[1], now, nonce .. ':' .. i) end
-  count = count + cost
   allowed = 1
+  if not dry then
+    for i = 1, cost do redis.call('ZADD', KEYS[1], now, nonce .. ':' .. i) end
+    count = count + cost
+  end
 end
-redis.call('PEXPIRE', KEYS[1], math.ceil(window * 1000) + 1000)
+if not dry then redis.call('PEXPIRE', KEYS[1], math.ceil(window * 1000) + 1000) end
 local reset_after = 0
-local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+local oldest = redis.call('ZRANGE', KEYS[1], expired, expired, 'WITHSCORES')
 if oldest[2] then reset_after = tonumber(oldest[2]) + window - now end
 local retry_after = 0
 if allowed == 0 then retry_after = reset_after end
@@ -49,6 +62,7 @@ return {allowed, tostring(limit - count), tostring(retry_after), tostring(reset_
 SLIDING_COUNTER = """
 local now = tonumber(ARGV[1]); local limit = tonumber(ARGV[2])
 local window = tonumber(ARGV[3]); local cost = tonumber(ARGV[4])
+local dry = ARGV[5] == '1'
 local start = math.floor(now / window) * window
 local data = redis.call('HMGET', KEYS[1], 'start', 'current', 'previous')
 local stored = tonumber(data[1]); local current = tonumber(data[2] or '0')
@@ -63,12 +77,16 @@ local elapsed = (now - start) / window
 local estimate = previous * (1 - elapsed) + current
 local allowed = 0
 if estimate + cost <= limit + 1e-9 then
-  current = current + cost
-  estimate = estimate + cost
   allowed = 1
+  if not dry then
+    current = current + cost
+    estimate = estimate + cost
+  end
 end
-redis.call('HSET', KEYS[1], 'start', start, 'current', current, 'previous', previous)
-redis.call('PEXPIRE', KEYS[1], math.ceil(window * 2000) + 1000)
+if not dry then
+  redis.call('HSET', KEYS[1], 'start', start, 'current', current, 'previous', previous)
+  redis.call('PEXPIRE', KEYS[1], math.ceil(window * 2000) + 1000)
+end
 local reset_after = start + window - now
 local retry_after = 0
 if allowed == 0 then
@@ -90,6 +108,7 @@ return {allowed, tostring(remaining), tostring(retry_after), tostring(reset_afte
 TOKEN_BUCKET = """
 local now = tonumber(ARGV[1]); local capacity = tonumber(ARGV[2])
 local rate = tonumber(ARGV[3]); local cost = tonumber(ARGV[4])
+local dry = ARGV[5] == '1'
 local data = redis.call('HMGET', KEYS[1], 'tokens', 'last')
 local tokens = tonumber(data[1]); local last = tonumber(data[2])
 if tokens == nil then tokens = capacity; last = now end
@@ -98,11 +117,13 @@ if elapsed < 0 then elapsed = 0 end
 tokens = math.min(capacity, tokens + elapsed * rate)
 local allowed = 0
 if tokens + 1e-9 >= cost then
-  tokens = tokens - cost
   allowed = 1
+  if not dry then tokens = tokens - cost end
 end
-redis.call('HSET', KEYS[1], 'tokens', tokens, 'last', now)
-redis.call('PEXPIRE', KEYS[1], math.ceil(((capacity - tokens) / rate) * 1000) + 1000)
+if not dry then
+  redis.call('HSET', KEYS[1], 'tokens', tokens, 'last', now)
+  redis.call('PEXPIRE', KEYS[1], math.ceil(((capacity - tokens) / rate) * 1000) + 1000)
+end
 local retry_after = 0
 if allowed == 0 then retry_after = (cost - tokens) / rate end
 local reset_after = (capacity - tokens) / rate
@@ -112,6 +133,7 @@ return {allowed, tostring(math.floor(tokens + 1e-9)), tostring(retry_after), tos
 GCRA = """
 local now = tonumber(ARGV[1]); local period = tonumber(ARGV[2])
 local burst = tonumber(ARGV[3]); local cost = tonumber(ARGV[4])
+local dry = ARGV[5] == '1'
 local tat = tonumber(redis.call('GET', KEYS[1]))
 if tat == nil or tat < now then tat = now end
 local new_tat = tat + period * cost
@@ -119,8 +141,10 @@ local allow_at = new_tat - burst * period
 local allowed = 0
 if allow_at <= now + 1e-9 then
   allowed = 1
-  redis.call('SET', KEYS[1], tostring(new_tat), 'PX', math.ceil((new_tat - now) * 1000) + 1000)
-  tat = new_tat
+  if not dry then
+    redis.call('SET', KEYS[1], tostring(new_tat), 'PX', math.ceil((new_tat - now) * 1000) + 1000)
+    tat = new_tat
+  end
 end
 local remaining = math.floor((now + burst * period - tat) / period + 1e-9)
 if remaining < 0 then remaining = 0 end
@@ -149,30 +173,35 @@ class RedisBackend:
         return bool(int(allowed)), float(remaining), float(retry_after), float(reset_after)
 
     def fixed_window(
-        self, key: str, limit: int, window: float, cost: int, now: float
+        self, key: str, limit: int, window: float, cost: int, now: float, dry_run: bool = False
     ) -> RawDecision:
-        return self._decode(self._fixed(keys=[key], args=[repr(now), limit, repr(window), cost]))
+        args = [repr(now), limit, repr(window), cost, int(dry_run)]
+        return self._decode(self._fixed(keys=[key], args=args))
 
     def sliding_log(
-        self, key: str, limit: int, window: float, cost: int, now: float
+        self, key: str, limit: int, window: float, cost: int, now: float, dry_run: bool = False
     ) -> RawDecision:
         nonce = secrets.token_hex(8)
-        return self._decode(
-            self._log(keys=[key], args=[repr(now), limit, repr(window), cost, nonce])
-        )
+        args = [repr(now), limit, repr(window), cost, nonce, int(dry_run)]
+        return self._decode(self._log(keys=[key], args=args))
 
     def sliding_counter(
-        self, key: str, limit: int, window: float, cost: int, now: float
+        self, key: str, limit: int, window: float, cost: int, now: float, dry_run: bool = False
     ) -> RawDecision:
-        return self._decode(self._counter(keys=[key], args=[repr(now), limit, repr(window), cost]))
+        args = [repr(now), limit, repr(window), cost, int(dry_run)]
+        return self._decode(self._counter(keys=[key], args=args))
 
     def token_bucket(
-        self, key: str, capacity: int, rate: float, cost: int, now: float
+        self, key: str, capacity: int, rate: float, cost: int, now: float, dry_run: bool = False
     ) -> RawDecision:
-        return self._decode(self._bucket(keys=[key], args=[repr(now), capacity, repr(rate), cost]))
+        args = [repr(now), capacity, repr(rate), cost, int(dry_run)]
+        return self._decode(self._bucket(keys=[key], args=args))
 
-    def gcra(self, key: str, period: float, burst: int, cost: int, now: float) -> RawDecision:
-        return self._decode(self._gcra(keys=[key], args=[repr(now), repr(period), burst, cost]))
+    def gcra(
+        self, key: str, period: float, burst: int, cost: int, now: float, dry_run: bool = False
+    ) -> RawDecision:
+        args = [repr(now), repr(period), burst, cost, int(dry_run)]
+        return self._decode(self._gcra(keys=[key], args=args))
 
     def reset(self, key: str) -> None:
         # Fixed-window keys carry a window suffix; SCAN them out rather than guessing.
