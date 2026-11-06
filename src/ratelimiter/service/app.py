@@ -116,7 +116,9 @@ def create_app(
         missing = [name for name, policy in policies.items() if policy is None]
         if missing:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Policies not found: {missing}")
-        decision = limiter.check_all(payload.key, policies.values(), cost=payload.cost)
+        run = partial(limiter.check_all, payload.key, policies.values(), cost=payload.cost)
+        metrics = app.state.metrics
+        decision = metrics.observe_all(run) if metrics is not None else run()
         return CheckOut(
             allowed=decision.allowed,
             limit=decision.limit,

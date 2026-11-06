@@ -64,5 +64,20 @@ class Metrics:
         self.decisions.labels(policy, algorithm, outcome).inc()
         return decision
 
+    def observe_all(self, check: Callable[[], Decision]) -> Decision:
+        """Run a multi-policy ``check`` and record one outcome per policy.
+
+        ``allowed`` means the request consumed from the policy and ``denied`` that this policy
+        turned it down. ``passed`` covers the rest: the policy had room, another one denied, and
+        nothing was consumed.
+        """
+        started = time.perf_counter()
+        decision = check()
+        self.latency.labels(self.backend, "composite").observe(time.perf_counter() - started)
+        for part in decision.parts:
+            outcome = "denied" if not part.allowed else "allowed" if decision.allowed else "passed"
+            self.decisions.labels(part.policy, part.algorithm.value, outcome).inc()
+        return decision
+
     def render(self) -> bytes:
         return generate_latest(self.registry)
