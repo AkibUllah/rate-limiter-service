@@ -2,6 +2,7 @@
 
 * adds ``X-RateLimit-Limit``, ``X-RateLimit-Remaining`` and ``X-RateLimit-Reset`` to every response
 * answers ``429`` with ``Retry-After`` and a JSON body when the policy is exhausted
+* accepts several policies, checked atomically; the headers then report the most restrictive one
 * identifies clients by IP by default (``X-Forwarded-For`` aware); plug in your own ``key_func``
   to limit per API key, per user, per tenant, ...
 """
@@ -9,7 +10,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 from starlette.concurrency import run_in_threadpool
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -19,7 +20,8 @@ from .limiter import RateLimiter
 from .policy import Policy
 
 KeyFunc = Callable[[Scope], str | None]
-PolicyFunc = Callable[[Scope], Policy | None]
+Policies = Policy | Sequence[Policy]
+PolicyFunc = Callable[[Scope], Policies | None]
 
 
 def _header(scope: Scope, name: bytes) -> str | None:
@@ -55,7 +57,7 @@ class RateLimitMiddleware:
         self,
         app: ASGIApp,
         limiter: RateLimiter,
-        policy: Policy | PolicyFunc,
+        policy: Policies | PolicyFunc,
         key_func: KeyFunc = client_ip_key,
         exempt_paths: Iterable[str] = ("/health",),
         cost_func: Callable[[Scope], int] | None = None,
@@ -63,16 +65,18 @@ class RateLimitMiddleware:
     ) -> None:
         self.app = app
         self.limiter = limiter
+        if not isinstance(policy, Policy) and not callable(policy):
+            policy = limiter.validate_policies(policy)  # fail at startup, not on every request
         self._policy = policy
         self.key_func = key_func
         self.exempt_paths = tuple(exempt_paths)
         self.cost_func = cost_func
         self.on_limited = on_limited
 
-    def policy_for(self, scope: Scope) -> Policy | None:
-        if isinstance(self._policy, Policy):
-            return self._policy
-        return self._policy(scope)
+    def policy_for(self, scope: Scope) -> Policies | None:
+        if callable(self._policy):
+            return self._policy(scope)
+        return self._policy
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or scope.get("path", "") in self.exempt_paths:
@@ -80,16 +84,18 @@ class RateLimitMiddleware:
             return
 
         policy = self.policy_for(scope)
-        key = self.key_func(scope) if policy is not None else None
-        if policy is None or key is None:
+        limited = policy is not None and (isinstance(policy, Policy) or len(policy) > 0)
+        key = self.key_func(scope) if limited else None
+        if key is None:
             await self.app(scope, receive, send)
             return
 
         cost = self.cost_func(scope) if self.cost_func else 1
+        check = self.limiter.check if isinstance(policy, Policy) else self.limiter.check_all
         if self.limiter.blocking:
-            decision = await run_in_threadpool(self.limiter.check, key, policy, cost)
+            decision = await run_in_threadpool(check, key, policy, cost)
         else:
-            decision = self.limiter.check(key, policy, cost)
+            decision = check(key, policy, cost)
 
         if not decision.allowed:
             if self.on_limited is not None:
