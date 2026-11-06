@@ -5,9 +5,10 @@ from __future__ import annotations
 import math
 import threading
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from .base import EPSILON, TIME_EPSILON, RawDecision
+from .base import EPSILON, TIME_EPSILON, RawDecision, Step
 
 
 @dataclass
@@ -38,7 +39,7 @@ class MemoryBackend:
     blocking = False
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._fixed: dict[str, _Window] = {}
         self._logs: dict[str, _Log] = {}
         self._sliding: dict[str, _SlidingCounter] = {}
@@ -151,6 +152,19 @@ class MemoryBackend:
         retry_after = 0.0 if allowed else allow_at - now
         reset_after = max(tat - now, 0.0)
         return allowed, remaining, retry_after, reset_after
+
+    # ------------------------------------------------------------------ composite
+
+    def evaluate_all(self, steps: Sequence[Step], cost: int, now: float) -> list[RawDecision]:
+        def run(step: Step, dry_run: bool) -> RawDecision:
+            method = getattr(self, step.algorithm)
+            return method(step.key, *step.params, cost, now, dry_run)
+
+        with self._lock:  # reentrant: each step takes it again
+            previews = [run(step, True) for step in steps]
+            if not all(allowed for allowed, *_ in previews):
+                return previews
+            return [run(step, False) for step in steps]
 
     # ------------------------------------------------------------------ housekeeping
 

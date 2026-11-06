@@ -8,12 +8,17 @@ With ``dry_run=True`` the same step is evaluated without writing anything: ``all
 whether ``cost`` units *would* be accepted and ``remaining`` is the current, unconsumed budget.
 This is what ``RateLimiter.peek`` and the service's ``/v1/inspect`` endpoint use.
 
+``evaluate_all`` runs several steps as one atomic unit: a dry run of every step first, then, only
+if all of them would pass, the real step for each. When any step is denied nothing is written and
+the dry-run results are returned, so a passing step reports its budget as it stands.
+
 ``now`` is always supplied by the caller (see :mod:`ratelimiter.clock`), which keeps the Redis and
 in-memory implementations deterministic under test and consistent across hosts.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import NamedTuple, Protocol
 
 RawDecision = tuple[bool, float, float, float]
@@ -52,5 +57,7 @@ class Backend(Protocol):
     def gcra(
         self, key: str, period: float, burst: int, cost: int, now: float, dry_run: bool = False
     ) -> RawDecision: ...
+
+    def evaluate_all(self, steps: Sequence[Step], cost: int, now: float) -> list[RawDecision]: ...
 
     def reset(self, key: str) -> None: ...
