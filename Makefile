@@ -2,7 +2,7 @@ PY ?= python3
 VENV ?= .venv
 BIN := $(VENV)/bin
 
-.PHONY: venv install dev test lint fmt run openapi docker-up docker-down clean bench
+.PHONY: venv install dev test test-redis lint fmt run openapi docker-up docker-down clean bench
 
 venv:
 	$(PY) -m venv $(VENV)
@@ -18,6 +18,10 @@ run:
 
 test:
 	$(BIN)/pytest
+
+# Also runs the shared suites on a real Redis. The database is flushed, so keep it disposable.
+test-redis:
+	TEST_REDIS_URL=$${TEST_REDIS_URL:-redis://localhost:6379/15} $(BIN)/pytest
 
 lint:
 	$(BIN)/ruff check src tests
