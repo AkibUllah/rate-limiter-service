@@ -189,3 +189,29 @@ def test_inspect_sees_state_shared_by_two_redis_instances(clock):
         assert state["remaining"] == 2 and state["would_allow"]
         assert redis_client.hgetall("rl:login:u") == before
         assert samples(b, "ratelimiter_backend_latency_seconds_count") == {}
+
+
+def test_multi_policy_check_records_one_outcome_per_policy(client):
+    client.post("/v1/policies", json={"name": "api", "limit": 100, "window_seconds": 60})
+    body = {"key": "k", "policies": ["otp", "api"]}
+    for _ in range(5):
+        client.post("/v1/check", json=body)
+
+    counts = decision_counts(client)
+    assert counts[("otp", "sliding_log", "allowed")] == 3
+    assert counts[("otp", "sliding_log", "denied")] == 2
+    assert counts[("api", "sliding_counter", "allowed")] == 3
+    assert counts[("api", "sliding_counter", "passed")] == 2
+    assert ("api", "sliding_counter", "denied") not in counts
+
+
+def test_multi_policy_check_observes_latency_once_under_composite(client):
+    client.post("/v1/policies", json={"name": "api", "limit": 100, "window_seconds": 60})
+    client.post("/v1/check", json={"key": "k", "policies": ["otp", "api"]})
+    client.post("/v1/check", json={"key": "k", "policy": "otp"})
+
+    counts = {
+        dict(k)["algorithm"]: v
+        for k, v in samples(client, "ratelimiter_backend_latency_seconds_count").items()
+    }
+    assert counts == {"composite": 1.0, "sliding_log": 1.0}
