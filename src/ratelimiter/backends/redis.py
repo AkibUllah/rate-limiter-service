@@ -137,14 +137,16 @@ local function gcra(key, now, period, burst, cost, dry)
   local new_tat = tat + period * cost
   local allow_at = new_tat - burst * period
   local allowed = 0
-  if allow_at <= now + 1e-9 then
+  if allow_at <= now + 1e-6 then
     allowed = 1
     if not dry then
-      redis.call('SET', key, tostring(new_tat), 'PX', math.ceil((new_tat - now) * 1000) + 1000)
+      -- tostring keeps 14 significant digits, which rounds an epoch timestamp to 0.1 ms.
+      local stored = string.format('%.17g', new_tat)
+      redis.call('SET', key, stored, 'PX', math.ceil((new_tat - now) * 1000) + 1000)
       tat = new_tat
     end
   end
-  local remaining = math.floor((now + burst * period - tat) / period + 1e-9)
+  local remaining = math.floor((now + burst * period - tat + 1e-6) / period)
   if remaining < 0 then remaining = 0 end
   local retry_after = 0
   if allowed == 0 then retry_after = allow_at - now end
