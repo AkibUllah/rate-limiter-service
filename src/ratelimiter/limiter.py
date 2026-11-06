@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 
-from .backends.base import Backend
+from .backends.base import Backend, RawDecision, Step
 from .backends.memory import MemoryBackend
 from .clock import Clock, SystemClock
 from .decision import Decision
@@ -51,29 +51,20 @@ class RateLimiter:
         """
         return self._evaluate(key, policy, cost, dry_run=True)
 
-    def _evaluate(self, key: str, policy: Policy, cost: int, dry_run: bool) -> Decision:
-        if cost <= 0:
-            raise ValueError("cost must be positive")
-        now = self.clock.now()
-        skey = self.storage_key(key, policy)
+    def _step(self, key: str, policy: Policy) -> Step:
         algorithm = policy.algorithm
-
-        if algorithm is Algorithm.FIXED_WINDOW:
-            raw = self.backend.fixed_window(skey, policy.limit, policy.window, cost, now, dry_run)
-        elif algorithm is Algorithm.SLIDING_LOG:
-            raw = self.backend.sliding_log(skey, policy.limit, policy.window, cost, now, dry_run)
-        elif algorithm is Algorithm.SLIDING_COUNTER:
-            raw = self.backend.sliding_counter(
-                skey, policy.limit, policy.window, cost, now, dry_run
-            )
-        elif algorithm is Algorithm.TOKEN_BUCKET:
-            raw = self.backend.token_bucket(skey, policy.capacity, policy.rate, cost, now, dry_run)
+        if algorithm is Algorithm.TOKEN_BUCKET:
+            params = (policy.capacity, policy.rate)
         elif algorithm is Algorithm.GCRA:
-            raw = self.backend.gcra(skey, policy.period, policy.capacity, cost, now, dry_run)
-        else:  # pragma: no cover - enum is exhaustive
-            raise ValueError(f"unsupported algorithm {algorithm!r}")
+            params = (policy.period, policy.capacity)
+        else:
+            params = (policy.limit, policy.window)
+        return Step(algorithm.value, self.storage_key(key, policy), params)
 
+    @staticmethod
+    def _decision(key: str, policy: Policy, raw: RawDecision) -> Decision:
         allowed, remaining, retry_after, reset_after = raw
+        algorithm = policy.algorithm
         return Decision(
             allowed=allowed,
             limit=policy.capacity
@@ -84,7 +75,16 @@ class RateLimiter:
             reset_after=max(reset_after, 0.0),
             key=key,
             algorithm=algorithm,
+            policy=policy.name,
         )
+
+    def _evaluate(self, key: str, policy: Policy, cost: int, dry_run: bool) -> Decision:
+        if cost <= 0:
+            raise ValueError("cost must be positive")
+        step = self._step(key, policy)
+        run = getattr(self.backend, step.algorithm)
+        raw = run(step.key, *step.params, cost, self.clock.now(), dry_run)
+        return self._decision(key, policy, raw)
 
     def reset(self, key: str, policy: Policy) -> None:
         self.backend.reset(self.storage_key(key, policy))

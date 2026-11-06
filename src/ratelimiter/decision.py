@@ -15,6 +15,7 @@ class Decision:
     reset_after: float  # seconds until the limiter state for this key is back to "full"
     key: str
     algorithm: Algorithm
+    policy: str | None = None  # name of the policy that produced this decision, if it has one
 
     def headers(self) -> dict[str, str]:
         headers = {
