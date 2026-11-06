@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .policy import Algorithm
@@ -16,6 +17,31 @@ class Decision:
     key: str
     algorithm: Algorithm
     policy: str | None = None  # name of the policy that produced this decision, if it has one
+    parts: tuple[Decision, ...] = ()  # per-policy decisions behind a composite check
+
+    @classmethod
+    def combine(cls, parts: Sequence[Decision]) -> Decision:
+        """Merge per-policy decisions into the one a caller should act on.
+
+        ``allowed`` needs every policy to allow, ``remaining`` is the smallest budget and
+        ``retry_after`` the longest wait. ``limit``, ``reset_after``, ``algorithm`` and ``policy``
+        come from the most restrictive policy, so the rate limit headers describe one real limit
+        rather than a mix: a denying policy first, then the least remaining, then the longest
+        wait. ``reset_after`` is never shorter than ``retry_after``.
+        """
+        binding = min(parts, key=lambda d: (d.allowed, d.remaining, -d.retry_after, -d.reset_after))
+        retry_after = max(d.retry_after for d in parts)
+        return cls(
+            allowed=all(d.allowed for d in parts),
+            limit=binding.limit,
+            remaining=min(d.remaining for d in parts),
+            retry_after=retry_after,
+            reset_after=max(binding.reset_after, retry_after),
+            key=binding.key,
+            algorithm=binding.algorithm,
+            policy=binding.policy,
+            parts=tuple(parts),
+        )
 
     def headers(self) -> dict[str, str]:
         headers = {
