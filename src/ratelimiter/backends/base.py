@@ -18,7 +18,8 @@ from typing import NamedTuple, Protocol
 
 RawDecision = tuple[bool, float, float, float]
 
-EPSILON = 1e-9  # tolerance for float comparisons on accumulated timestamps
+EPSILON = 1e-9  # tolerance for float comparisons on token counts and window estimates
+TIME_EPSILON = 1e-6  # seconds; epoch timestamps only resolve to about 2.4e-7, so 1e-9 is too tight
 
 
 class Step(NamedTuple):

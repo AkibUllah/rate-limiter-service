@@ -7,7 +7,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 
-from .base import EPSILON, RawDecision
+from .base import EPSILON, TIME_EPSILON, RawDecision
 
 
 @dataclass
@@ -143,11 +143,11 @@ class MemoryBackend:
                 tat = now
             new_tat = tat + period * cost
             allow_at = new_tat - burst * period
-            allowed = allow_at <= now + EPSILON
+            allowed = allow_at <= now + TIME_EPSILON
             if allowed and not dry_run:
                 self._tat[key] = new_tat
                 tat = new_tat
-        remaining = max(math.floor((now + burst * period - tat) / period + EPSILON), 0)
+        remaining = max(math.floor((now + burst * period - tat + TIME_EPSILON) / period), 0)
         retry_after = 0.0 if allowed else allow_at - now
         reset_after = max(tat - now, 0.0)
         return allowed, remaining, retry_after, reset_after

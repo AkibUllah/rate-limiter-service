@@ -189,3 +189,19 @@ def test_storage_key_is_scoped_by_policy_name_or_algorithm(memory_limiter):
     # Different policies on the same key do not interfere.
     assert memory_limiter.check("k", named).allowed
     assert memory_limiter.check("k", anon).allowed
+
+
+def test_gcra_still_limits_at_very_high_rates(limiter):
+    policy = Policy(limit=1000, window=0.01, algorithm=Algorithm.GCRA)  # one slot every 10 us
+    decisions = burst(limiter, "k", policy, 1200)
+    # Adding 10 us to an epoch timestamp rounds a little, so allow a sliver of drift. What must
+    # never happen is the stored timestamp failing to advance, which disables the limit.
+    assert abs(sum(d.allowed for d in decisions) - 1000) <= 5
+
+
+@pytest.mark.parametrize("offset", [0.0, 0.137, 41.3, 1234.567, 98765.4321])
+def test_gcra_remaining_is_not_off_by_one_at_any_timestamp(limiter, clock, offset):
+    clock.advance(offset)
+    policy = Policy(limit=100, window=60, algorithm=Algorithm.GCRA)
+    decisions = burst(limiter, "k", policy, 100)
+    assert [d.remaining for d in decisions] == list(range(99, -1, -1))
