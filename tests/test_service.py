@@ -155,3 +155,111 @@ def test_redis_backed_service_shares_policies_and_state(clock):
         assert b.get("/v1/policies/shared").status_code == 200
         assert a.post("/v1/check", json={"key": "k", "policy": "shared"}).json()["allowed"] is True
         assert b.post("/v1/check", json={"key": "k", "policy": "shared"}).json()["allowed"] is False
+
+
+@pytest.fixture
+def pair_client(client):
+    for name, limit, window in (("per-second", 2, 1), ("per-hour", 3, 3600)):
+        response = client.post(
+            "/v1/policies",
+            json={
+                "name": name,
+                "limit": limit,
+                "window_seconds": window,
+                "algorithm": "sliding_log",
+            },
+        )
+        assert response.status_code == 201
+    return client
+
+
+def check_pair(client, **extra):
+    body = {"key": "u1", "policies": ["per-hour", "per-second"], **extra}
+    return client.post("/v1/check", json=body)
+
+
+def inspect(client, policy):
+    return client.get("/v1/inspect", params={"key": "u1", "policy": policy}).json()
+
+
+def test_check_with_several_policies_reports_the_most_restrictive(pair_client):
+    body = check_pair(pair_client).json()
+    assert body["allowed"] is True
+    assert body["policy"] == "per-second"
+    assert (body["limit"], body["remaining"]) == (2, 1)
+    assert [(p["policy"], p["remaining"]) for p in body["policies"]] == [
+        ("per-hour", 2),
+        ("per-second", 1),
+    ]
+
+
+def test_denied_multi_policy_check_consumes_nothing(pair_client, clock):
+    check_pair(pair_client)
+    check_pair(pair_client)
+    for _ in range(5):
+        body = check_pair(pair_client).json()
+        assert body["allowed"] is False
+        assert body["policy"] == "per-second" and body["retry_after"] == pytest.approx(1)
+        assert [p["allowed"] for p in body["policies"]] == [True, False]
+    assert inspect(pair_client, "per-hour")["remaining"] == 1
+
+    clock.advance(1.001)
+    assert check_pair(pair_client).json()["allowed"] is True
+    denied = check_pair(pair_client).json()
+    assert denied["allowed"] is False
+    assert denied["policy"] == "per-hour" and denied["retry_after"] > 3500
+
+
+def test_multi_policy_cost_applies_to_every_policy(pair_client):
+    assert check_pair(pair_client, cost=2).json()["remaining"] == 0
+    assert inspect(pair_client, "per-hour")["remaining"] == 1
+
+
+def test_single_policy_check_has_no_per_policy_results(client):
+    assert client.post("/v1/check", json={"key": "u"}).json()["policies"] is None
+
+
+def test_unknown_policy_names_are_reported_and_nothing_is_consumed(pair_client):
+    body = {"key": "u1", "policies": ["per-hour", "nope", "missing"]}
+    response = pair_client.post("/v1/check", json=body)
+    assert response.status_code == 404
+    assert "nope" in response.json()["detail"] and "missing" in response.json()["detail"]
+    assert inspect(pair_client, "per-hour")["remaining"] == 3
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"key": "k", "policies": []},
+        {"key": "k", "policies": ["a", "a"]},
+        {"key": "k", "policies": ["bad name"]},
+        {"key": "k", "policies": [f"p{i}" for i in range(17)]},
+        {"key": "k", "policies": ["a"], "policy": "b"},
+        {"key": "k", "policies": ["a"], "inline": {"limit": 1, "window_seconds": 1}},
+        {"key": "k", "policies": "a"},
+    ],
+    ids=["empty", "repeated", "bad-name", "too-many", "with-policy", "with-inline", "not-a-list"],
+)
+def test_invalid_policy_lists_are_rejected(client, body):
+    assert client.post("/v1/check", json=body).status_code == 422
+
+
+def test_redis_backed_service_checks_policies_atomically(clock):
+    redis = fakeredis.FakeRedis()
+    settings = Settings(_env_file=None, log_level="WARNING", service_policy=None)
+    apps = [
+        create_app(
+            settings,
+            limiter=RateLimiter(RedisBackend(redis), clock=clock),
+            policy_store=RedisPolicyStore(redis),
+        )
+        for _ in range(2)
+    ]
+    with TestClient(apps[0]) as a, TestClient(apps[1]) as b:
+        a.post("/v1/policies", json={"name": "low", "limit": 1, "window_seconds": 60})
+        a.post("/v1/policies", json={"name": "high", "limit": 9, "window_seconds": 60})
+        body = {"key": "shared", "policies": ["low", "high"]}
+        assert a.post("/v1/check", json=body).json()["allowed"] is True
+        assert b.post("/v1/check", json=body).json()["allowed"] is False
+        state = b.get("/v1/inspect", params={"key": "shared", "policy": "high"}).json()
+        assert state["remaining"] == 8
