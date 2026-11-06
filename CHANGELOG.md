@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `RateLimiter.check_all(key, policies, cost=1)` evaluates several policies as one atomic step: allowed only if every policy allows, with the smallest `remaining` and the longest `retry_after`. A denied check consumes and writes nothing. Runs in one Lua script on Redis and under one lock in memory (#2).
+- `Decision.combine`, plus `Decision.policy` and `Decision.parts` for the per-policy results. Limit, reset and algorithm come from the most restrictive policy, so the headers describe one real limit (#2).
+- `RateLimitMiddleware` takes a list of policies, and a `policy` callable may return one (#2).
+- `POST /v1/check` takes `policies`: up to 16 stored names, validated before anything is consumed. The response adds per-policy results (#2).
+- `ratelimiter_decisions_total` counts multi-policy checks per policy, with a new `passed` outcome for a policy that had room while another one denied. Their latency is recorded under `algorithm="composite"` (#2).
+- `TEST_REDIS_URL` and `make test-redis` run the shared test suites on a real Redis, and a CI job does so on every push.
+
+### Changed
+
+- The `Backend` protocol gained `evaluate_all(steps, cost, now)`. Custom backends need it for `check_all`.
+
+### Fixed
+
+- GCRA on Redis stored its timestamp rounded to 0.1 ms. At very high rates it stopped advancing, so the limit was not enforced, and at normal rates `remaining` was often one short.
+- GCRA on both backends could deny a request one slot early, because its timestamp tolerance was smaller than the resolution of an epoch timestamp.
+
 ## [0.2.0] - 2026-10-27
 
 ### Added
