@@ -9,6 +9,10 @@ Quick use::
     decision = limiter.check("user:42", policy)
     if not decision.allowed:
         ...  # decision.retry_after seconds
+
+    # several limits at once: consumes from all of them, or from none
+    limits = [Policy.parse("10/second", name="second"), Policy.parse("1000/hour", name="hour")]
+    decision = limiter.check_all("user:42", limits)
 """
 
 from .backends.memory import MemoryBackend

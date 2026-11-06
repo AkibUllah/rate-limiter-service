@@ -42,6 +42,7 @@ Payment APIs get hammered by retry storms, OTP endpoints get brute-forced, and a
 - `Decision` objects carrying `allowed`, `remaining`, `retry_after`, `reset_after` and ready-made HTTP headers
 - Pure ASGI `RateLimitMiddleware` for FastAPI/Starlette: `X-RateLimit-Limit/Remaining/Reset`, `429` with `Retry-After`, IP or header keys, per-request policy selection, exempt paths, hooks
 - FastAPI service: `POST /v1/check` with named or inline policies, policy CRUD (stored in memory or in a Redis hash shared by all instances), `POST /v1/reset`, `/health`, optional API key, and the middleware guarding the service itself
+- Composite limits: `RateLimiter.check_all()`, `RateLimitMiddleware` and `POST /v1/check` evaluate several policies (say `10/second` plus `1000/hour`) as one atomic step. One Lua script on Redis, one lock in memory: a denied request consumes nothing from any policy, and the headers report the most restrictive limit
 - Read-only inspection: `RateLimiter.peek()` and `GET /v1/inspect` report remaining budget, `retry_after` and `reset_after` for a key without consuming anything (dry-run Lua scripts on Redis that never write, never prune and never touch TTLs)
 - Prometheus metrics at `/metrics`: `ratelimiter_decisions_total{policy,algorithm,outcome}` and a `ratelimiter_backend_latency_seconds{backend,algorithm}` histogram, one registry per app
 - Injectable clock (`ManualClock`) so tests and benchmarks move time deterministically
@@ -70,10 +71,11 @@ flowchart LR
 
 Key decisions:
 
-- **Algorithm logic lives in the backend, dispatch lives in the limiter.** Each backend implements five primitive operations that take `now` and return `(allowed, remaining, retry_after, reset_after)`. The Python and Lua implementations are line-for-line equivalents, and the same test-suite runs against both (via `fakeredis[lua]`).
+- **Algorithm logic lives in the backend, dispatch lives in the limiter.** Each backend implements five primitive operations that take `now` and return `(allowed, remaining, retry_after, reset_after)`, plus `evaluate_all` to run several as a unit. The Python and Lua implementations are line-for-line equivalents, and the same test-suite runs against both (via `fakeredis[lua]`).
 - **Time is a parameter.** The limiter reads one clock and passes the timestamp into the backend; Redis never calls `TIME`. That makes behaviour deterministic under test and keeps instances with the same wall clock in agreement.
 - **Atomicity via Lua.** Every Redis step is a single `EVALSHA`, so two instances racing on the same key cannot both see "one slot left". Floats come back as strings because Redis truncates Lua numbers.
 - **Accepted requests consume, denied ones do not.** A denied request leaves the state untouched; `retry_after` tells the caller exactly when the next unit frees up.
+- **Composite checks evaluate first and commit second.** `evaluate_all` dry-runs every policy, then repeats the real step for each only if all of them allow. Both passes sit inside one Lua script (or one lock), so no other client can act in between, and because they reuse the single-policy functions a composite check cannot drift from a plain one. A denied check writes nothing at all, not even a TTL refresh.
 - **Inspection runs the same code path.** `peek` is the same backend step with a `dry_run` flag, so what `/v1/inspect` reports is exactly what the next `/v1/check` would decide. On Redis the sliding-log dry run skips expired entries by rank (`ZCOUNT` + `ZRANGE`) instead of deleting them, so a peek is a pure read.
 - **Pure ASGI middleware.** No `BaseHTTPMiddleware`, so streaming responses work and the per-request overhead is a dictionary lookup for the memory backend; Redis calls are offloaded to a thread so they do not block the event loop.
 
@@ -191,6 +193,47 @@ app.add_middleware(
 
 `policy` may also be a callable `scope -> Policy | None` to pick limits per route or per tenant (returning `None` skips limiting).
 
+### Composite limits
+
+Pass several policies to enforce them together. The request consumes from all of them, or from none:
+
+```python
+per_second = Policy.parse("10/second", name="per-second")
+per_hour = Policy.parse("1000/hour;algorithm=gcra", name="per-hour")
+
+decision = limiter.check_all("user:42", [per_second, per_hour], cost=1)
+decision.allowed       # True only if every policy allows
+decision.remaining     # the smallest budget left
+decision.retry_after   # the longest wait among the policies that denied
+decision.policy        # "per-second": the most restrictive policy
+decision.parts         # one Decision per policy, in the order given
+```
+
+`limit`, `reset_after` and `algorithm` come from the most restrictive policy, so the `X-RateLimit-*` headers describe one real limit rather than a mix: a denying policy first, then the least remaining, then the longest wait. On a denial, a part that would have passed reports its budget as it stands.
+
+Each policy needs its own state, and state is stored per policy name (per algorithm when unnamed). So give the policies in a check distinct names: two unnamed `sliding_counter` policies would share a budget, and `check_all` raises `ValueError` instead. State is shared with `check`, `peek` and `reset` for the same policy.
+
+The middleware takes a list, and a `policy` callable may return one:
+
+```python
+app.add_middleware(RateLimitMiddleware, limiter=limiter, policy=[per_second, per_hour])
+```
+
+Over HTTP, `policies` takes up to 16 stored names (use it instead of `policy` or `inline`):
+
+```bash
+curl -s -X POST localhost:8000/v1/check -H 'content-type: application/json' \
+  -d '{"key":"user:42","policies":["burst","hourly"]}'
+# {"allowed":false,"limit":2,"remaining":0,"retry_after":4.974318,"reset_after":9.974318,
+#  "key":"user:42","policy":"burst","algorithm":"gcra","policies":[
+#   {"policy":"burst","allowed":false,"limit":2,"remaining":0,"retry_after":4.974318,...},
+#   {"policy":"hourly","allowed":true,"limit":1000,"remaining":998,"retry_after":0.0,...}]}
+```
+
+Repeated or malformed names and mixing `policies` with `policy` or `inline` return `422`; unknown names return `404` and nothing is consumed.
+
+The composite script touches one key per policy, so it needs them on one Redis node. A single instance or a primary with replicas just works. Redis Cluster needs every key in one hash slot, for example with a hash tag in the key (`"{user:42}"`); that setup is not covered by the test suite.
+
 ### Inspecting a key
 
 ```python
@@ -216,6 +259,8 @@ ratelimiter_decisions_total{algorithm="sliding_log",outcome="denied",policy="otp
 ratelimiter_backend_latency_seconds_bucket{algorithm="sliding_log",backend="redis",le="0.001"} 6.0
 ```
 
+A multi-policy check counts one decision per policy. Besides `allowed` and `denied`, `outcome="passed"` marks a policy that had room while another one denied, so nothing was consumed. Its backend latency is recorded once under `algorithm="composite"`.
+
 Useful queries: deny ratio per policy `sum by (policy) (rate(ratelimiter_decisions_total{outcome="denied"}[5m])) / sum by (policy) (rate(ratelimiter_decisions_total[5m]))`, and backend p99 `histogram_quantile(0.99, sum by (le, backend) (rate(ratelimiter_backend_latency_seconds_bucket[5m])))`. Inline policies are counted under `policy="inline"` to keep label cardinality bounded. `/metrics` has no API key and is exempt from `SERVICE_POLICY`; keep it on an internal network or set `METRICS_ENABLED=false`.
 
 ### Deterministic tests
@@ -238,7 +283,7 @@ assert limiter.check("k", policy).allowed
 | --- | --- | --- |
 | GET | `/health` | Status, backend in use, number of stored policies |
 | GET | `/v1/algorithms` | Algorithms with one-line descriptions |
-| POST | `/v1/check` | `{key, policy?, inline?, cost?}` -> `{allowed, limit, remaining, retry_after, reset_after, ...}` |
+| POST | `/v1/check` | `{key, policy?, inline?, policies?, cost?}` -> `{allowed, limit, remaining, retry_after, reset_after, ...}`; with `policies`, an atomic check of several stored policies plus per-policy results |
 | GET | `/v1/inspect?key=&policy=&cost=` | Current state of a key under a stored policy, without consuming: `{would_allow, remaining, retry_after, reset_after, ...}` |
 | POST | `/v1/reset` | Clear the state of one key under a named policy |
 | GET | `/metrics` | Prometheus metrics (when enabled and `prometheus-client` is installed) |
@@ -254,7 +299,7 @@ src/ratelimiter/
 ├── policy.py          # Policy, Algorithm, string parsing
 ├── decision.py        # Decision + HTTP headers
 ├── clock.py           # Clock protocol, SystemClock, ManualClock
-├── limiter.py         # RateLimiter: dispatch, key scoping, check / peek
+├── limiter.py         # RateLimiter: dispatch, key scoping, check / check_all / peek
 ├── middleware.py      # RateLimitMiddleware, client_ip_key, header_key
 ├── backends/
 │   ├── base.py        # Backend protocol
@@ -262,7 +307,7 @@ src/ratelimiter/
 │   └── redis.py       # RedisBackend (Lua scripts)
 └── service/           # FastAPI app: config, policy store, schemas, metrics, app factory, asgi
 bench/bench.py         # benchmark producing the table above
-tests/                 # 180 tests; algorithm suite runs on memory and fakeredis backends
+tests/                 # 448 tests; shared suites run on memory, fakeredis and optionally real Redis
 ```
 
 ## Testing
@@ -270,14 +315,14 @@ tests/                 # 180 tests; algorithm suite runs on memory and fakeredis
 ```bash
 make test   # or: pytest
 make lint
+make test-redis   # adds a real Redis to the shared suites (TEST_REDIS_URL; the database is flushed)
 ```
 
-Covered: policy parsing and validation; for every algorithm on both backends: limit-then-deny, independent keys, denied requests not consuming quota, recovery after the window, reset, weighted cost, decision metadata; algorithm-specific behaviour (fixed-window boundary burst, exact sliding log expiry, weighted sliding counter and its `retry_after` prediction, token bucket refill and capacity cap, GCRA spacing and burst); middleware headers, 429 body, exempt paths, header/IP keys with `X-Forwarded-For`, per-request policy selection, cost and hooks; service health, policy CRUD, named/inline/default checks, reset, validation, API key, self-protection, two Redis-backed instances sharing policies and state; `peek` on both backends for every algorithm (no keys created, no state change across interleaved peeks, matches the next check, cost-aware, expired sliding-log entries left in place); metrics labels, latency histogram, per-app registries, disabling, `/v1/inspect` semantics and validation; benchmark smoke run.
+Covered: policy parsing and validation; for every algorithm on both backends: limit-then-deny, independent keys, denied requests not consuming quota, recovery after the window, reset, weighted cost, decision metadata; algorithm-specific behaviour (fixed-window boundary burst, exact sliding log expiry, weighted sliding counter and its `retry_after` prediction, token bucket refill and capacity cap, GCRA spacing and burst); middleware headers, 429 body, exempt paths, header/IP keys with `X-Forwarded-For`, per-request policy selection, cost and hooks; service health, policy CRUD, named/inline/default checks, reset, validation, API key, self-protection, two Redis-backed instances sharing policies and state; `peek` on both backends for every algorithm (no keys created, no state change across interleaved peeks, matches the next check, cost-aware, expired sliding-log entries left in place); `check_all` for every pair of algorithms on every backend (a denial consumes and stores nothing, policy order does not matter, shared state with `check`, `peek` and `reset`, atomicity across threads and clients, memory and Redis deciding identically over random traffic); metrics labels, latency histogram, per-app registries, disabling, `/v1/inspect` semantics and validation; benchmark smoke run.
 
 ## Roadmap
 
 - [ ] Async backend variant (`redis.asyncio`) for fully non-blocking middleware (#1)
-- [ ] Multi-policy checks (e.g. `10/second` and `1000/hour` evaluated together) (#2)
 - [ ] Local cache with Redis as the source of truth for very hot keys (#4)
 - [ ] Client SDK snippets (Go, Node) for the service API (#5)
 
