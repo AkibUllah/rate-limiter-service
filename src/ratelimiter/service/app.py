@@ -26,6 +26,7 @@ from .schemas import (
     MessageOut,
     PolicyIn,
     PolicyOut,
+    PolicyResultOut,
     ResetIn,
 )
 from .store import MemoryPolicyStore, PolicyStore, RedisPolicyStore
@@ -109,6 +110,36 @@ def create_app(
 
     protected = [Depends(require_api_key)]
 
+    def _check_all(payload: CheckIn, store: PolicyStore, limiter: RateLimiter) -> CheckOut:
+        # Every name is resolved before anything is consumed.
+        policies = {name: store.get(name) for name in payload.policies}
+        missing = [name for name, policy in policies.items() if policy is None]
+        if missing:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Policies not found: {missing}")
+        decision = limiter.check_all(payload.key, policies.values(), cost=payload.cost)
+        return CheckOut(
+            allowed=decision.allowed,
+            limit=decision.limit,
+            remaining=decision.remaining,
+            retry_after=round(decision.retry_after, 6),
+            reset_after=round(decision.reset_after, 6),
+            key=payload.key,
+            policy=decision.policy,
+            algorithm=decision.algorithm,
+            policies=[
+                PolicyResultOut(
+                    policy=part.policy,
+                    allowed=part.allowed,
+                    limit=part.limit,
+                    remaining=part.remaining,
+                    retry_after=round(part.retry_after, 6),
+                    reset_after=round(part.reset_after, 6),
+                    algorithm=part.algorithm,
+                )
+                for part in decision.parts
+            ],
+        )
+
     @app.get("/health", response_model=HealthOut, tags=["meta"])
     def health(request: Request) -> HealthOut:
         return HealthOut(
@@ -131,6 +162,8 @@ def create_app(
     @app.post("/v1/check", response_model=CheckOut, tags=["limits"], dependencies=protected)
     def check(payload: CheckIn, request: Request) -> CheckOut:
         store = _store(request)
+        if payload.policies is not None:
+            return _check_all(payload, store, _limiter(request))
         if payload.inline is not None:
             policy = payload.inline.to_policy(name=None)
             policy_name = "inline"

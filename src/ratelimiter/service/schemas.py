@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, model_validator
+from typing import Annotated
+
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from ..policy import Algorithm, Policy
 
 NAME_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,63}$"
+MAX_POLICIES_PER_CHECK = 16
 
 
 class PolicySpec(BaseModel):
@@ -55,13 +58,32 @@ class CheckIn(BaseModel):
     inline: PolicySpec | None = Field(
         default=None, description="Ad-hoc policy used when no name is given"
     )
+    policies: list[Annotated[str, StringConstraints(pattern=NAME_PATTERN)]] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_POLICIES_PER_CHECK,
+        description="Stored policies to check together: all allow and consume, or none consume",
+    )
     cost: int = Field(default=1, gt=0, le=10_000)
 
     @model_validator(mode="after")
     def one_policy_source(self) -> CheckIn:
-        if self.policy and self.inline:
-            raise ValueError("provide either `policy` (name) or `inline`, not both")
+        sources = [self.policy, self.inline, self.policies]
+        if sum(bool(source) for source in sources) > 1:
+            raise ValueError("provide only one of `policy`, `inline` or `policies`")
+        if self.policies is not None and len(set(self.policies)) != len(self.policies):
+            raise ValueError("`policies` must not repeat a name")
         return self
+
+
+class PolicyResultOut(BaseModel):
+    policy: str
+    allowed: bool = Field(description="Whether this policy alone would let the request through")
+    limit: int
+    remaining: int
+    retry_after: float
+    reset_after: float
+    algorithm: Algorithm
 
 
 class CheckOut(BaseModel):
@@ -71,8 +93,11 @@ class CheckOut(BaseModel):
     retry_after: float
     reset_after: float
     key: str
-    policy: str
+    policy: str = Field(description="The policy checked, or the most restrictive of `policies`")
     algorithm: Algorithm
+    policies: list[PolicyResultOut] | None = Field(
+        default=None, description="Per-policy results, for a check of several policies"
+    )
 
 
 class InspectOut(BaseModel):
