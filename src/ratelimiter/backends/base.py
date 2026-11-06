@@ -14,11 +14,19 @@ in-memory implementations deterministic under test and consistent across hosts.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 RawDecision = tuple[bool, float, float, float]
 
 EPSILON = 1e-9  # tolerance for float comparisons on accumulated timestamps
+
+
+class Step(NamedTuple):
+    """One policy applied to one storage key: `algorithm` names the backend method to run."""
+
+    algorithm: str
+    key: str
+    params: tuple[float, float]  # the two policy parameters that method takes after `key`
 
 
 class Backend(Protocol):
