@@ -8,152 +8,162 @@ import secrets
 
 from .base import RawDecision
 
-FIXED_WINDOW = """
-local now = tonumber(ARGV[1]); local limit = tonumber(ARGV[2])
-local window = tonumber(ARGV[3]); local cost = tonumber(ARGV[4])
-local dry = ARGV[5] == '1'
-local start = math.floor(now / window) * window
-local wkey = KEYS[1] .. ':' .. string.format('%.0f', start)
-local count = tonumber(redis.call('GET', wkey) or '0')
-local allowed = 0
-if count + cost <= limit then
-  allowed = 1
-  if not dry then
-    count = count + cost
-    redis.call('SET', wkey, count, 'PX', math.ceil(window * 1000) + 1000)
+# Each algorithm is one Lua function with the same signature, so a single-policy script and the
+# composite script run exactly the same step. `a` and `b` are that algorithm's two parameters, in
+# the order given by the matching method on RedisBackend.
+_FIXED_WINDOW_STEP = """
+local function fixed_window(key, now, limit, window, cost, dry)
+  local start = math.floor(now / window) * window
+  local wkey = key .. ':' .. string.format('%.0f', start)
+  local count = tonumber(redis.call('GET', wkey) or '0')
+  local allowed = 0
+  if count + cost <= limit then
+    allowed = 1
+    if not dry then
+      count = count + cost
+      redis.call('SET', wkey, count, 'PX', math.ceil(window * 1000) + 1000)
+    end
   end
+  local reset_after = start + window - now
+  local retry_after = 0
+  if allowed == 0 then retry_after = reset_after end
+  return {allowed, tostring(limit - count), tostring(retry_after), tostring(reset_after)}
 end
-local reset_after = start + window - now
-local retry_after = 0
-if allowed == 0 then retry_after = reset_after end
-return {allowed, tostring(limit - count), tostring(retry_after), tostring(reset_after)}
 """
 
-SLIDING_LOG = """
-local now = tonumber(ARGV[1]); local limit = tonumber(ARGV[2])
-local window = tonumber(ARGV[3]); local cost = tonumber(ARGV[4]); local nonce = ARGV[5]
-local dry = ARGV[6] == '1'
--- Entries with score <= now - window have expired. A dry run skips them by rank instead of
--- deleting them, so the sorted set is left exactly as it was.
-local expired = 0
-if dry then
-  expired = redis.call('ZCOUNT', KEYS[1], '-inf', now - window)
-else
-  redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)
-end
-local count = redis.call('ZCARD', KEYS[1]) - expired
-local allowed = 0
-if count + cost <= limit then
-  allowed = 1
-  if not dry then
-    for i = 1, cost do redis.call('ZADD', KEYS[1], now, nonce .. ':' .. i) end
-    count = count + cost
-  end
-end
-if not dry then redis.call('PEXPIRE', KEYS[1], math.ceil(window * 1000) + 1000) end
-local reset_after = 0
-local oldest = redis.call('ZRANGE', KEYS[1], expired, expired, 'WITHSCORES')
-if oldest[2] then reset_after = tonumber(oldest[2]) + window - now end
-local retry_after = 0
-if allowed == 0 then retry_after = reset_after end
-return {allowed, tostring(limit - count), tostring(retry_after), tostring(reset_after)}
-"""
-
-SLIDING_COUNTER = """
-local now = tonumber(ARGV[1]); local limit = tonumber(ARGV[2])
-local window = tonumber(ARGV[3]); local cost = tonumber(ARGV[4])
-local dry = ARGV[5] == '1'
-local start = math.floor(now / window) * window
-local data = redis.call('HMGET', KEYS[1], 'start', 'current', 'previous')
-local stored = tonumber(data[1]); local current = tonumber(data[2] or '0')
-local previous = tonumber(data[3] or '0')
-if stored == nil then
-  current = 0; previous = 0
-elseif stored ~= start then
-  if stored == start - window then previous = current else previous = 0 end
-  current = 0
-end
-local elapsed = (now - start) / window
-local estimate = previous * (1 - elapsed) + current
-local allowed = 0
-if estimate + cost <= limit + 1e-9 then
-  allowed = 1
-  if not dry then
-    current = current + cost
-    estimate = estimate + cost
-  end
-end
-if not dry then
-  redis.call('HSET', KEYS[1], 'start', start, 'current', current, 'previous', previous)
-  redis.call('PEXPIRE', KEYS[1], math.ceil(window * 2000) + 1000)
-end
-local reset_after = start + window - now
-local retry_after = 0
-if allowed == 0 then
-  if previous <= 0 then
-    retry_after = reset_after
+_SLIDING_LOG_STEP = """
+local function sliding_log(key, now, limit, window, cost, dry, nonce)
+  -- Entries with score <= now - window have expired. A dry run skips them by rank instead of
+  -- deleting them, so the sorted set is left exactly as it was.
+  local expired = 0
+  if dry then
+    expired = redis.call('ZCOUNT', key, '-inf', now - window)
   else
-    local needed = 1 - (limit - current - cost) / previous
-    local t = start + window * needed - now
-    if t < 0 then t = 0 end
-    if t > reset_after then t = reset_after end
-    retry_after = t
+    redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
   end
+  local count = redis.call('ZCARD', key) - expired
+  local allowed = 0
+  if count + cost <= limit then
+    allowed = 1
+    if not dry then
+      for i = 1, cost do redis.call('ZADD', key, now, nonce .. ':' .. i) end
+      count = count + cost
+    end
+  end
+  if not dry then redis.call('PEXPIRE', key, math.ceil(window * 1000) + 1000) end
+  local reset_after = 0
+  local oldest = redis.call('ZRANGE', key, expired, expired, 'WITHSCORES')
+  if oldest[2] then reset_after = tonumber(oldest[2]) + window - now end
+  local retry_after = 0
+  if allowed == 0 then retry_after = reset_after end
+  return {allowed, tostring(limit - count), tostring(retry_after), tostring(reset_after)}
 end
-local remaining = limit - estimate
-if remaining < 0 then remaining = 0 end
-return {allowed, tostring(remaining), tostring(retry_after), tostring(reset_after)}
 """
 
-TOKEN_BUCKET = """
-local now = tonumber(ARGV[1]); local capacity = tonumber(ARGV[2])
-local rate = tonumber(ARGV[3]); local cost = tonumber(ARGV[4])
-local dry = ARGV[5] == '1'
-local data = redis.call('HMGET', KEYS[1], 'tokens', 'last')
-local tokens = tonumber(data[1]); local last = tonumber(data[2])
-if tokens == nil then tokens = capacity; last = now end
-local elapsed = now - last
-if elapsed < 0 then elapsed = 0 end
-tokens = math.min(capacity, tokens + elapsed * rate)
-local allowed = 0
-if tokens + 1e-9 >= cost then
-  allowed = 1
-  if not dry then tokens = tokens - cost end
-end
-if not dry then
-  redis.call('HSET', KEYS[1], 'tokens', tokens, 'last', now)
-  redis.call('PEXPIRE', KEYS[1], math.ceil(((capacity - tokens) / rate) * 1000) + 1000)
-end
-local retry_after = 0
-if allowed == 0 then retry_after = (cost - tokens) / rate end
-local reset_after = (capacity - tokens) / rate
-return {allowed, tostring(math.floor(tokens + 1e-9)), tostring(retry_after), tostring(reset_after)}
-"""
-
-GCRA = """
-local now = tonumber(ARGV[1]); local period = tonumber(ARGV[2])
-local burst = tonumber(ARGV[3]); local cost = tonumber(ARGV[4])
-local dry = ARGV[5] == '1'
-local tat = tonumber(redis.call('GET', KEYS[1]))
-if tat == nil or tat < now then tat = now end
-local new_tat = tat + period * cost
-local allow_at = new_tat - burst * period
-local allowed = 0
-if allow_at <= now + 1e-9 then
-  allowed = 1
+_SLIDING_COUNTER_STEP = """
+local function sliding_counter(key, now, limit, window, cost, dry)
+  local start = math.floor(now / window) * window
+  local data = redis.call('HMGET', key, 'start', 'current', 'previous')
+  local stored = tonumber(data[1]); local current = tonumber(data[2] or '0')
+  local previous = tonumber(data[3] or '0')
+  if stored == nil then
+    current = 0; previous = 0
+  elseif stored ~= start then
+    if stored == start - window then previous = current else previous = 0 end
+    current = 0
+  end
+  local elapsed = (now - start) / window
+  local estimate = previous * (1 - elapsed) + current
+  local allowed = 0
+  if estimate + cost <= limit + 1e-9 then
+    allowed = 1
+    if not dry then
+      current = current + cost
+      estimate = estimate + cost
+    end
+  end
   if not dry then
-    redis.call('SET', KEYS[1], tostring(new_tat), 'PX', math.ceil((new_tat - now) * 1000) + 1000)
-    tat = new_tat
+    redis.call('HSET', key, 'start', start, 'current', current, 'previous', previous)
+    redis.call('PEXPIRE', key, math.ceil(window * 2000) + 1000)
   end
+  local reset_after = start + window - now
+  local retry_after = 0
+  if allowed == 0 then
+    if previous <= 0 then
+      retry_after = reset_after
+    else
+      local needed = 1 - (limit - current - cost) / previous
+      local t = start + window * needed - now
+      if t < 0 then t = 0 end
+      if t > reset_after then t = reset_after end
+      retry_after = t
+    end
+  end
+  local remaining = limit - estimate
+  if remaining < 0 then remaining = 0 end
+  return {allowed, tostring(remaining), tostring(retry_after), tostring(reset_after)}
 end
-local remaining = math.floor((now + burst * period - tat) / period + 1e-9)
-if remaining < 0 then remaining = 0 end
-local retry_after = 0
-if allowed == 0 then retry_after = allow_at - now end
-local reset_after = tat - now
-if reset_after < 0 then reset_after = 0 end
-return {allowed, tostring(remaining), tostring(retry_after), tostring(reset_after)}
 """
+
+_TOKEN_BUCKET_STEP = """
+local function token_bucket(key, now, capacity, rate, cost, dry)
+  local data = redis.call('HMGET', key, 'tokens', 'last')
+  local tokens = tonumber(data[1]); local last = tonumber(data[2])
+  if tokens == nil then tokens = capacity; last = now end
+  local elapsed = now - last
+  if elapsed < 0 then elapsed = 0 end
+  tokens = math.min(capacity, tokens + elapsed * rate)
+  local allowed = 0
+  if tokens + 1e-9 >= cost then
+    allowed = 1
+    if not dry then tokens = tokens - cost end
+  end
+  if not dry then
+    redis.call('HSET', key, 'tokens', tokens, 'last', now)
+    redis.call('PEXPIRE', key, math.ceil(((capacity - tokens) / rate) * 1000) + 1000)
+  end
+  local retry_after = 0
+  if allowed == 0 then retry_after = (cost - tokens) / rate end
+  local reset_after = (capacity - tokens) / rate
+  return {allowed, tostring(math.floor(tokens + 1e-9)), tostring(retry_after),
+          tostring(reset_after)}
+end
+"""
+
+_GCRA_STEP = """
+local function gcra(key, now, period, burst, cost, dry)
+  local tat = tonumber(redis.call('GET', key))
+  if tat == nil or tat < now then tat = now end
+  local new_tat = tat + period * cost
+  local allow_at = new_tat - burst * period
+  local allowed = 0
+  if allow_at <= now + 1e-9 then
+    allowed = 1
+    if not dry then
+      redis.call('SET', key, tostring(new_tat), 'PX', math.ceil((new_tat - now) * 1000) + 1000)
+      tat = new_tat
+    end
+  end
+  local remaining = math.floor((now + burst * period - tat) / period + 1e-9)
+  if remaining < 0 then remaining = 0 end
+  local retry_after = 0
+  if allowed == 0 then retry_after = allow_at - now end
+  local reset_after = tat - now
+  if reset_after < 0 then reset_after = 0 end
+  return {allowed, tostring(remaining), tostring(retry_after), tostring(reset_after)}
+end
+"""
+
+_SINGLE_CALL = """
+return {name}(KEYS[1], tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]),
+              tonumber(ARGV[4]), ARGV[5] == '1', ARGV[6])
+"""
+
+FIXED_WINDOW = _FIXED_WINDOW_STEP + _SINGLE_CALL.format(name="fixed_window")
+SLIDING_LOG = _SLIDING_LOG_STEP + _SINGLE_CALL.format(name="sliding_log")
+SLIDING_COUNTER = _SLIDING_COUNTER_STEP + _SINGLE_CALL.format(name="sliding_counter")
+TOKEN_BUCKET = _TOKEN_BUCKET_STEP + _SINGLE_CALL.format(name="token_bucket")
+GCRA = _GCRA_STEP + _SINGLE_CALL.format(name="gcra")
 
 
 class RedisBackend:
@@ -182,7 +192,7 @@ class RedisBackend:
         self, key: str, limit: int, window: float, cost: int, now: float, dry_run: bool = False
     ) -> RawDecision:
         nonce = secrets.token_hex(8)
-        args = [repr(now), limit, repr(window), cost, nonce, int(dry_run)]
+        args = [repr(now), limit, repr(window), cost, int(dry_run), nonce]
         return self._decode(self._log(keys=[key], args=args))
 
     def sliding_counter(
