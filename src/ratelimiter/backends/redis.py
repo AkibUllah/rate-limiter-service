@@ -5,8 +5,9 @@ truncates Lua numbers to integers in replies."""
 from __future__ import annotations
 
 import secrets
+from collections.abc import Sequence
 
-from .base import RawDecision
+from .base import RawDecision, Step
 
 # Each algorithm is one Lua function with the same signature, so a single-policy script and the
 # composite script run exactly the same step. `a` and `b` are that algorithm's two parameters, in
@@ -167,6 +168,42 @@ SLIDING_COUNTER = _SLIDING_COUNTER_STEP + _SINGLE_CALL.format(name="sliding_coun
 TOKEN_BUCKET = _TOKEN_BUCKET_STEP + _SINGLE_CALL.format(name="token_bucket")
 GCRA = _GCRA_STEP + _SINGLE_CALL.format(name="gcra")
 
+# ARGV: now, cost, nonce, then (algorithm, a, b) for each of KEYS. The whole script is one atomic
+# unit, so nothing can change between the dry pass and the commit pass, and a step that passed the
+# dry run is certain to pass again with the same `now`.
+COMPOSITE = (
+    _FIXED_WINDOW_STEP
+    + _SLIDING_LOG_STEP
+    + _SLIDING_COUNTER_STEP
+    + _TOKEN_BUCKET_STEP
+    + _GCRA_STEP
+    + """
+local steps = {
+  fixed_window = fixed_window, sliding_log = sliding_log, sliding_counter = sliding_counter,
+  token_bucket = token_bucket, gcra = gcra,
+}
+local now = tonumber(ARGV[1]); local cost = tonumber(ARGV[2]); local nonce = ARGV[3]
+
+local function run(dry)
+  local results = {}
+  local all_allowed = true
+  for i = 1, #KEYS do
+    local base = 1 + i * 3
+    local result = steps[ARGV[base]](
+      KEYS[i], now, tonumber(ARGV[base + 1]), tonumber(ARGV[base + 2]), cost, dry, nonce
+    )
+    if result[1] == 0 then all_allowed = false end
+    results[i] = result
+  end
+  return results, all_allowed
+end
+
+local previews, all_allowed = run(true)
+if not all_allowed then return previews end
+return (run(false))
+"""
+)
+
 
 class RedisBackend:
     blocking = True
@@ -178,6 +215,7 @@ class RedisBackend:
         self._counter = client.register_script(SLIDING_COUNTER)
         self._bucket = client.register_script(TOKEN_BUCKET)
         self._gcra = client.register_script(GCRA)
+        self._composite = client.register_script(COMPOSITE)
 
     @staticmethod
     def _decode(reply) -> RawDecision:
@@ -214,6 +252,13 @@ class RedisBackend:
     ) -> RawDecision:
         args = [repr(now), repr(period), burst, cost, int(dry_run)]
         return self._decode(self._gcra(keys=[key], args=args))
+
+    def evaluate_all(self, steps: Sequence[Step], cost: int, now: float) -> list[RawDecision]:
+        args: list = [repr(now), cost, secrets.token_hex(8)]
+        for step in steps:
+            args.extend([step.algorithm, repr(step.params[0]), repr(step.params[1])])
+        replies = self._composite(keys=[step.key for step in steps], args=args)
+        return [self._decode(reply) for reply in replies]
 
     def reset(self, key: str) -> None:
         # Fixed-window keys carry a window suffix; SCAN them out rather than guessing.

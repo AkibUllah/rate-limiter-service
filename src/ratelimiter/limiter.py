@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Iterable
 
 from .backends.base import Backend, RawDecision, Step
 from .backends.memory import MemoryBackend
@@ -41,6 +42,52 @@ class RateLimiter:
                 "rate limited key=%s policy=%s retry_after=%.3f", key, policy, decision.retry_after
             )
         return decision
+
+    def check_all(self, key: str, policies: Iterable[Policy], cost: int = 1) -> Decision:
+        """Consume `cost` units from every policy, or from none of them.
+
+        All policies are evaluated atomically against one timestamp. The returned decision is
+        allowed only if each policy allows; see :meth:`Decision.combine` for how the other fields
+        are merged, and ``Decision.parts`` for the per-policy results. On a denial, a part that
+        would have passed reports its budget as it stands, since nothing was consumed.
+
+        Each policy needs its own state, so policies must be distinct: see
+        :meth:`validate_policies`. State is shared with :meth:`check`, :meth:`peek` and
+        :meth:`reset` for the same policy.
+        """
+        policies = self.validate_policies(policies)
+        if cost <= 0:
+            raise ValueError("cost must be positive")
+        steps = [self._step(key, policy) for policy in policies]
+        raws = self.backend.evaluate_all(steps, cost, self.clock.now())
+        decision = Decision.combine(
+            [self._decision(key, policy, raw) for policy, raw in zip(policies, raws, strict=True)]
+        )
+        if not decision.allowed:
+            denied_by = [p.policy or p.algorithm.value for p in decision.parts if not p.allowed]
+            log.debug(
+                "rate limited key=%s policies=%s retry_after=%.3f",
+                key,
+                denied_by,
+                decision.retry_after,
+            )
+        return decision
+
+    def validate_policies(self, policies: Iterable[Policy]) -> list[Policy]:
+        """Reject a policy list that cannot be checked together, and return it as a list.
+
+        State is stored per policy name, or per algorithm for an unnamed policy, so two unnamed
+        policies with the same algorithm (or two with the same name) would share one budget.
+        """
+        policies = list(policies)
+        if not policies:
+            raise ValueError("at least one policy is required")
+        scopes = [self.storage_key("", policy) for policy in policies]
+        if len(set(scopes)) != len(scopes):
+            raise ValueError(
+                "policies in one check must have distinct state; give each one a unique name"
+            )
+        return policies
 
     def peek(self, key: str, policy: Policy, cost: int = 1) -> Decision:
         """Report the state of `key` without consuming anything.
